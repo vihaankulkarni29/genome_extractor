@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+    #!/usr/bin/env python3
 """
 Federated Genome Harvester - Multi-source genome data retrieval tool
 """
@@ -225,9 +225,17 @@ Examples:
     parser.add_argument('--min_quality_score', type=int, default=0,
                         help='Minimum quality score for genome inclusion (0-10, default: 0)')
     parser.add_argument('--require_amr_data', action='store_true',
-                        help='Only download genomes with AMR resistance data')
+                         help='Only download genomes with AMR resistance data')
     parser.add_argument('--require_location', action='store_true',
-                        help='Only download genomes with geographic location data')
+                         help='Only download genomes with geographic location data')
+    parser.add_argument('--genome_types', nargs='*',
+                         choices=['complete', 'chromosome', 'scaffold', 'contig', 'plasmid', 'all'],
+                         default=['all'],
+                         help='Genome assembly types to include (default: all). Can specify multiple: --genome_types complete chromosome scaffold')
+    parser.add_argument('--exclude_types', nargs='*',
+                         choices=['complete', 'chromosome', 'scaffold', 'contig', 'plasmid'],
+                         default=[],
+                         help='Genome assembly types to exclude. Can specify multiple: --exclude_types plasmid contig')
     parser.add_argument('--log_level', default='INFO',
                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                        help='Logging level')
@@ -263,26 +271,80 @@ Examples:
                 parser.error("--query must be provided with --download_only (genome IDs/accessions)")
 
             genome_ids = args.query.split(',')
-            logging.info(f"Downloading {len(genome_ids)} genomes from {args.source.upper()} using {args.parallel_downloads} parallel workers...")
+            logging.info(f"Checking {len(genome_ids)} accessions for completeness and organism match before download...")
 
-            # Convert genome IDs to records format for parallel download
-            download_records = []
-            for genome_id in genome_ids:
-                genome_id = genome_id.strip()
-                # For download-only mode, we'll try the first available source
-                for source in sources:
-                    download_records.append({
-                        'accession': genome_id,
-                        'database': source.upper()
+            # Extract organism name from query (first two words, e.g., 'Escherichia coli')
+            import re
+            organism_match = re.match(r"([A-Za-z]+\s+[a-zA-Z]+)", args.query)
+            target_organism = organism_match.group(1).strip() if organism_match else None
+
+            # Fetch metadata for all accessions
+            client = NCBIClient()
+            metadata_records = client._extract_metadata_batch([gid.strip() for gid in genome_ids])
+
+            # Filter for complete genomes and correct organism
+            filtered_records = []
+            skipped = []
+            for record in metadata_records:
+                accession = record.get('accession') or record.get('genome_id')
+                title = (record.get('title') or '').lower()
+                organism = (record.get('organism') or '').lower()
+                assembly_level = (record.get('assembly_level') or '').lower()
+
+                # Check for completeness (not contig/plasmid/scaffold, correct prefix)
+                is_complete = (
+                    'chromosome' in title or
+                    'complete genome' in title or
+                    'complete sequence' in title or
+                    (accession and (accession.startswith('CP') or accession.startswith('NC_') or accession.startswith('NZ_CP')))
+                )
+                is_not_fragment = not (
+                    'scaffold' in title or 'contig' in title or 'plasmid' in title or
+                    (accession and accession.startswith('NZ_') and not accession.startswith('NZ_CP'))
+                )
+                organism_match = target_organism.lower() in organism if target_organism else True
+
+                if is_complete and is_not_fragment and organism_match:
+                    # Mark for download
+                    filtered_records.append({
+                        'accession': accession,
+                        'database': 'NCBI'
                     })
-                    break  # Only try the first source for each genome
+                else:
+                    skipped.append({
+                        'accession': accession,
+                        'reason': f"{'contig/scaffold/plasmid' if not is_not_fragment else ''}{'incomplete genome' if not is_complete else ''}{'wrong organism' if not organism_match else ''}",
+                        'title': title,
+                        'organism': organism
+                    })
 
-            # Use parallel download
-            successful = download_genomes_parallel(download_records, args.output_dir, sources, args.parallel_downloads)
+            logging.info(f"{len(filtered_records)} accessions passed completeness and organism filter. {len(skipped)} skipped.")
+            if skipped:
+                # Save skipped accessions to error report
+                error_report_path = os.path.join(args.output_dir, 'skipped_accessions_report.csv')
+                import csv
+                with open(error_report_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=['accession', 'reason', 'title', 'organism'])
+                    writer.writeheader()
+                    for row in skipped:
+                        writer.writerow(row)
+                logging.info(f"Skipped accessions report saved to {error_report_path}")
+
+            if not filtered_records:
+                logging.warning("No accessions passed completeness and organism filter. Nothing to download.")
+                return
+
+            # Use parallel download for filtered records
+            successful = download_genomes_parallel(filtered_records, args.output_dir, sources, args.parallel_downloads)
             logging.info(f"Parallel download completed: {len(successful)} genomes successfully downloaded")
 
         else:
             # Search and retrieve mode
+            # Extract organism name from query (first two words, e.g., 'Escherichia coli')
+            import re
+            organism_match = re.match(r"([A-Za-z]+\s+[a-zA-Z]+)", args.query)
+            target_organism = organism_match.group(1).strip() if organism_match else None
+
             for source in sources:
                 logging.info(f"Searching {source.upper()} with query: {args.query}")
 
@@ -310,10 +372,10 @@ Examples:
                     logging.warning(f"No genomes found in {source.upper()} for the query")
                     continue
 
-                # Harmonize the data
-                harmonized_records = harmonize_data(raw_records, source)
+                # Harmonize the data with strict organism enforcement
+                harmonized_records = harmonize_data(raw_records, source, target_organism)
+                logging.info(f"Harmonizer: {len(harmonized_records)} genomes match '{target_organism}' in {source.upper()}")
                 all_harmonized_records.extend(harmonized_records)
-                logging.info(f"Found {len(harmonized_records)} genomes in {source.upper()}")
 
             if not all_harmonized_records:
                 logging.warning("No genomes found in any database for the query")
@@ -335,7 +397,7 @@ Examples:
 
             logging.info(f"Metadata saved to {metadata_path}")
 
-            # Apply quality filtering
+            # Apply quality and genome type filtering
             filtered_records = []
             for record in all_harmonized_records:
                 quality_score = record.get('quality_score', 0)
@@ -357,6 +419,11 @@ Examples:
                     country = record.get('country')
                     if not country:
                         continue
+
+                # Apply genome type filtering
+                genome_type = record.get('genome_type', 'unknown')
+                if not _passes_genome_type_filter(genome_type, args.genome_types, args.exclude_types):
+                    continue
 
                 filtered_records.append(record)
 
@@ -490,6 +557,48 @@ def save_metadata_to_csv(records: List[Dict[str, Any]], output_file: str):
     logging.info(f"CSV metadata saved with {len(fieldnames)} columns and {len(flattened_data)} rows")
 
 
+def _passes_genome_type_filter(genome_type: str, include_types: List[str], exclude_types: List[str]) -> bool:
+    """Check if a genome type passes the filtering criteria"""
+    if 'all' in include_types:
+        # If 'all' is specified, only exclude explicitly excluded types
+        return genome_type not in exclude_types
+
+    # If specific types are included, check if genome_type is in the include list
+    # and not in the exclude list
+    return genome_type in include_types and genome_type not in exclude_types
+
+
+def _detect_genome_type(title: str, accession: str) -> str:
+    """Detect genome type from title and accession"""
+    title_lower = title.lower() if title else ''
+    accession_upper = accession.upper() if accession else ''
+
+    # Check for plasmids first (most specific)
+    if 'plasmid' in title_lower or 'plasmid' in accession_upper:
+        return 'plasmid'
+
+    # Check for complete genomes/chromosomes
+    if ('complete genome' in title_lower or 'complete sequence' in title_lower or
+        'chromosome' in title_lower or accession_upper.startswith('CP') or
+        accession_upper.startswith('NC_') or accession_upper.startswith('NZ_CP')):
+        return 'complete'
+
+    # Check for scaffolds
+    if 'scaffold' in title_lower:
+        return 'scaffold'
+
+    # Check for contigs
+    if 'contig' in title_lower:
+        return 'contig'
+
+    # Default to chromosome if it looks like a main chromosome
+    if 'chromosome' in title_lower and not any(x in title_lower for x in ['plasmid', 'scaffold', 'contig']):
+        return 'chromosome'
+
+    # If we can't determine, return unknown
+    return 'unknown'
+
+
 def print_summary(records: List[Dict[str, Any]], source: str):
     """Print a summary of the retrieved data"""
     if not records:
@@ -505,6 +614,7 @@ def print_summary(records: List[Dict[str, Any]], source: str):
     organisms = {}
     countries = {}
     amr_count = 0
+    genome_types = {}
 
     for record in records:
         # Count organisms
@@ -521,8 +631,18 @@ def print_summary(records: List[Dict[str, Any]], source: str):
         if amr_phenotypes:
             amr_count += 1
 
+        # Count genome types
+        genome_type = record.get('genome_type', 'unknown')
+        genome_types[genome_type] = genome_types.get(genome_type, 0) + 1
+
     print(f"Total genomes: {total_genomes}")
     print(f"Genomes with AMR data: {amr_count}")
+
+    if genome_types:
+        print(f"\nGenome types:")
+        sorted_types = sorted(genome_types.items(), key=lambda x: x[1], reverse=True)
+        for gtype, count in sorted_types:
+            print(f"  - {gtype}: {count}")
 
     if organisms:
         print(f"\nTop organisms:")

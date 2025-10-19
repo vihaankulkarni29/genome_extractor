@@ -1177,6 +1177,9 @@ class NCBIClient:
                         metadata.update(biosample_metadata)
                     metadata.update(biosample_metadata)
 
+        # Detect and add genome type
+        metadata['genome_type'] = self._detect_genome_type(metadata.get('title', ''), metadata.get('accession', ''))
+
         # Add quality score
         metadata['quality_score'] = self._calculate_metadata_score(metadata)
 
@@ -1696,6 +1699,36 @@ class NCBIClient:
         for unit in units:
             if unit in mic_value.lower():
                 return unit
+        return 'unknown'
+
+    def _detect_genome_type(self, title: str, accession: str) -> str:
+        """Detect genome type from title and accession"""
+        title_lower = title.lower() if title else ''
+        accession_upper = accession.upper() if accession else ''
+
+        # Check for plasmids first (most specific)
+        if 'plasmid' in title_lower or 'plasmid' in accession_upper:
+            return 'plasmid'
+
+        # Check for complete genomes/chromosomes
+        if ('complete genome' in title_lower or 'complete sequence' in title_lower or
+            'chromosome' in title_lower or accession_upper.startswith('CP') or
+            accession_upper.startswith('NC_') or accession_upper.startswith('NZ_CP')):
+            return 'complete'
+
+        # Check for scaffolds
+        if 'scaffold' in title_lower:
+            return 'scaffold'
+
+        # Check for contigs
+        if 'contig' in title_lower:
+            return 'contig'
+
+        # Default to chromosome if it looks like a main chromosome
+        if 'chromosome' in title_lower and not any(x in title_lower for x in ['plasmid', 'scaffold', 'contig']):
+            return 'chromosome'
+
+        # If we can't determine, return unknown
         return 'unknown'
 
     def _calculate_metadata_score(self, metadata: Dict[str, Any]) -> int:

@@ -103,11 +103,16 @@ venv.bak/
 .dmypy.json
 dmypy.json
 
-# Output directories
+# Output directories and downloaded files
 output/
 genomes/
+*_genomes/
 *.fasta
 *.fa
+*.json
+*.csv
+*_metadata.json
+*_metadata.csv
 
 # IDE
 .vscode/

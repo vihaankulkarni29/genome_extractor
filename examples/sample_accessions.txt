@@ -1,0 +1,3 @@
+"# Example accession list for testing"  
+"NZ_CP066851"  
+"NZ_JAVTGZ010000002" 

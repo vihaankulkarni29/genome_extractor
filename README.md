@@ -6,6 +6,7 @@ A robust, multi-database tool for downloading genome sequences as FASTA files wi
 
 - **Multi-database genome retrieval**: Search across NCBI, BV-BRC, EnteroBase, and PATRIC
 - **🎯 Smart genome selection**: Automatically selects highest-quality genomes based on metadata completeness
+- **🔬 Genome type filtering**: Include/exclude specific assembly types (complete, chromosome, scaffold, contig, plasmid)
 - **Quality filtering**: Configurable quality thresholds ensure only valuable genomes are downloaded
 - Handle large files efficiently with streaming downloads
 - Parse search URLs or custom queries from any supported database
@@ -122,6 +123,10 @@ python ncbi_genome_extractor.py --query "your complex query" --max_results 100
 **Smart selection options:**
 - `--no_quality_selection`: Disable quality-based genome selection (use first N results instead of best N)
 
+**Genome type filtering options:**
+- `--genome_types`: Include specific genome types (complete, chromosome, scaffold, contig, plasmid, all)
+- `--exclude_types`: Exclude specific genome types from results
+
 **Metadata options:**
 - `--metadata_format`: Format for metadata output (json or csv, default: json)
 - `--no_metadata`: Skip metadata extraction (not recommended for AMR research)
@@ -158,6 +163,45 @@ python ncbi_genome_extractor.py --query "(Escherichia coli AND marcolide resista
 ```
 
 **Note:** When using complex queries with parentheses, operators (AND, OR, NOT), or special characters, wrap the entire query in single quotes to avoid shell interpretation issues.
+
+### 🔬 Genome Type Filtering
+
+**Control exactly which genome assembly types you download:**
+
+**Genome Type Categories:**
+- **complete**: Complete genome assemblies (CP123456, NC_123456)
+- **chromosome**: Individual chromosomes
+- **scaffold**: Scaffolded assemblies
+- **contig**: Contig assemblies
+- **plasmid**: Plasmid sequences
+- **all**: All genome types (default)
+
+**Examples:**
+
+**Get only complete genomes:**
+```bash
+python harvester.py --query "Escherichia coli" --max_results 20 --genome_types complete
+```
+
+**Get only plasmids:**
+```bash
+python harvester.py --query "Escherichia coli" --max_results 10 --genome_types plasmid
+```
+
+**Exclude plasmids and contigs:**
+```bash
+python harvester.py --query "Escherichia coli" --max_results 25 --exclude_types plasmid contig
+```
+
+**Get everything except plasmids:**
+```bash
+python harvester.py --query "Escherichia coli" --max_results 30 --genome_types all --exclude_types plasmid
+```
+
+**Perfect for AMR research:**
+- Study chromosomal resistance: `--exclude_types plasmid`
+- Focus on complete assemblies: `--genome_types complete`
+- Get all sequence types: `--genome_types all` (default)
 
 ### Automatic Metadata Extraction
 

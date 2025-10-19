@@ -3,16 +3,17 @@
 Data Harmonizer - Standardizes genome metadata from different sources
 """
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 
-def harmonize_data(raw_records: List[Dict[str, Any]], source: str) -> List[Dict[str, Any]]:
+def harmonize_data(raw_records: List[Dict[str, Any]], source: str, target_organism: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Harmonize raw genome records from different sources into a standardized schema.
 
     Args:
         raw_records: List of raw genome records from a specific source
-        source: Source database ('ncbi' or 'bvbrc')
+        source: Source database ('ncbi', 'bvbrc', etc.)
+        target_organism: Only harmonize records matching this organism (case-insensitive, optional)
 
     Returns:
         List of harmonized genome records with standardized schema
@@ -20,6 +21,35 @@ def harmonize_data(raw_records: List[Dict[str, Any]], source: str) -> List[Dict[
     harmonized_records = []
 
     for record in raw_records:
+        # Only harmonize if organism matches target (if provided)
+        organism = record.get('organism', '')
+        if target_organism is not None and (not organism or target_organism.lower() not in organism.lower()):
+            continue
+
+        # For accession-based runs, enforce completeness (exclude contigs/scaffolds)
+        title = record.get('title', '').lower()
+        accession = record.get('accession', '')
+        is_complete = (
+            'chromosome' in title or
+            'complete genome' in title or
+            'complete sequence' in title or
+            accession.startswith('CP') or
+            accession.startswith('NC_') or
+            accession.startswith('NZ_CP')
+        )
+        is_not_fragment = not (
+            'scaffold' in title or
+            'contig' in title or
+            'plasmid' in title or
+            (accession.startswith('NZ_') and not accession.startswith('NZ_CP'))
+        )
+
+        # If running in accession mode (no query, just accessions), enforce completeness
+        # This logic is additive: query-based search remains unchanged
+        if target_organism is not None:
+            if not (is_complete and is_not_fragment):
+                continue
+
         if source == 'ncbi':
             harmonized_record = _harmonize_ncbi_record(record)
         elif source == 'bvbrc':
@@ -33,7 +63,6 @@ def harmonize_data(raw_records: List[Dict[str, Any]], source: str) -> List[Dict[
 
         # Add database source information
         harmonized_record['database'] = source.upper()
-
         harmonized_records.append(harmonized_record)
 
     return harmonized_records
