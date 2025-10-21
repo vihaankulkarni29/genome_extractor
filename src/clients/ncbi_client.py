@@ -172,16 +172,25 @@ class NCBIClient:
         return self._search_nuccore_fallback(query, max_results)
 
     def _search_assemblies_with_metadata(self, query: str, max_results: int) -> List[str]:
-        """Search assembly database for genomes likely to have rich metadata"""
-        # Create metadata-focused assembly query with progressively broader searches
+        """Enhanced assembly search with multiple strategies for rich metadata"""
+        # Prioritize assemblies with direct BioSample/BioProject links and clinical relevance
         strategies = [
-            # Best: Both BioProject and BioSample with complete genomes
-            f"({query}) AND latest[Filter] AND (chromosome[Assembly Level] OR complete genome[Assembly Level]) AND bioproject[Filter] AND biosample[Filter]",
-            # Good: Either BioProject or BioSample with any complete assembly
-            f"({query}) AND latest[Filter] AND (chromosome[Assembly Level] OR complete genome[Assembly Level] OR scaffold[Assembly Level]) AND (bioproject[Filter] OR biosample[Filter])",
-            # Moderate: Latest assemblies with metadata filters
+            # Strategy 1: Direct BioSample/BioProject linked assemblies (BEST)
+            f"({query}) AND bioproject[Filter] AND biosample[Filter] AND latest[Filter] AND (chromosome[Assembly Level] OR complete genome[Assembly Level])",
+
+            # Strategy 2: Clinical/research assemblies with metadata
+            f"({query}) AND (clinical OR surveillance OR outbreak OR resistance) AND latest[Filter] AND (bioproject[Filter] OR biosample[Filter])",
+
+            # Strategy 3: Recent assemblies (2020+) with metadata indicators
+            f"({query}) AND 2020:2025[PDAT] AND (bioproject[Filter] OR biosample[Filter]) AND latest[Filter]",
+
+            # Strategy 4: Complete genomes with any metadata
+            f"({query}) AND latest[Filter] AND (chromosome[Assembly Level] OR complete genome[Assembly Level]) AND (bioproject[Filter] OR biosample[Filter])",
+
+            # Strategy 5: Any assemblies with metadata (fallback)
             f"({query}) AND latest[Filter] AND (bioproject[Filter] OR biosample[Filter])",
-            # Fallback: Any latest assemblies
+
+            # Strategy 6: All latest assemblies (last resort)
             f"({query}) AND latest[Filter]"
         ]
         
@@ -228,45 +237,156 @@ class NCBIClient:
         return nucleotide_accessions
 
     def _get_assembly_nucleotide_accessions_batch(self, assembly_ids: List[str]) -> List[str]:
-        """Get nucleotide accessions from assembly IDs in batch"""
-        summary_url = NCBI_BASE_URL + "esummary.fcgi"
-        params = {
-            'db': 'assembly',
-            'id': ','.join(assembly_ids),
-            'retmode': 'xml',
-            'email': self.email,
-            'api_key': self.api_key if self.api_key else None
-        }
-
-        params = {k: v for k, v in params.items() if v is not None}
-        response = self._make_request(summary_url, params)
-        
-        if not response:
+        """Get nucleotide accessions from assembly IDs in batch with improved mapping"""
+        if not assembly_ids:
             return []
 
         nucleotide_accessions = []
+
+        # Process in smaller batches for better reliability
+        batch_size = 50
+        for i in range(0, len(assembly_ids), batch_size):
+            batch_ids = assembly_ids[i:i + batch_size]
+
+            summary_url = NCBI_BASE_URL + "esummary.fcgi"
+            params = {
+                'db': 'assembly',
+                'id': ','.join(batch_ids),
+                'retmode': 'xml',
+                'email': self.email,
+                'api_key': self.api_key if self.api_key else None
+            }
+
+            params = {k: v for k, v in params.items() if v is not None}
+            response = self._make_request(summary_url, params)
+
+            if response:
+                try:
+                    root = ET.fromstring(response.text)
+                    for docsum in root.findall('.//DocSum'):
+                        accession_found = False
+
+                        # First priority: Look for GenBank accession in synonym field
+                        for item in docsum.findall('Item'):
+                            name = item.get('Name')
+                            if name == 'Synonym' and item.text:
+                                synonym_text = item.text
+                                if 'GenBank:' in synonym_text:
+                                    genbank_acc = synonym_text.split('GenBank:')[1].split(';')[0].strip()
+                                    if genbank_acc and self._is_valid_nucleotide_accession(genbank_acc):
+                                        nucleotide_accessions.append(genbank_acc)
+                                        accession_found = True
+                                        break
+
+                        # Second priority: Use RefSeq accession if available
+                        if not accession_found:
+                            for item in docsum.findall('Item'):
+                                name = item.get('Name')
+                                if name == 'AssemblyAccession' and item.text:
+                                    assembly_acc = item.text
+                                    # Try to convert assembly accession to nucleotide accession
+                                    nucleotide_acc = self._convert_assembly_to_nucleotide_accession(assembly_acc)
+                                    if nucleotide_acc:
+                                        nucleotide_accessions.append(nucleotide_acc)
+                                        accession_found = True
+                                        break
+
+                        # Third priority: Try to find linked nucleotide records
+                        if not accession_found:
+                            assembly_id = None
+                            for item in docsum.findall('Item'):
+                                if item.get('Name') == 'Id':
+                                    assembly_id = item.text
+                                    break
+
+                            if assembly_id:
+                                linked_accessions = self._find_nucleotide_accessions_for_assembly(assembly_id)
+                                if linked_accessions:
+                                    nucleotide_accessions.extend(linked_accessions[:1])  # Take first one
+
+                except ET.ParseError as e:
+                    logging.warning(f"Failed to parse assembly summary response: {e}")
+
+        # Remove duplicates and validate
+        unique_accessions = []
+        seen = set()
+        for acc in nucleotide_accessions:
+            if acc and acc not in seen and self._is_valid_nucleotide_accession(acc):
+                unique_accessions.append(acc)
+                seen.add(acc)
+
+        logging.info(f"Mapped {len(unique_accessions)} valid nucleotide accessions from {len(assembly_ids)} assemblies")
+        return unique_accessions
+
+    def _convert_assembly_to_nucleotide_accession(self, assembly_accession: str) -> Optional[str]:
+        """Convert assembly accession to nucleotide accession"""
+        if not assembly_accession:
+            return None
+
+        # GCF -> NC (RefSeq chromosome)
+        if assembly_accession.startswith('GCF_'):
+            # Try to find the corresponding NC_ accession
+            nc_accession = assembly_accession.replace('GCF_', 'NC_')
+            return nc_accession
+
+        # GCA -> NZ_CP (GenBank complete)
+        elif assembly_accession.startswith('GCA_'):
+            # Try to find the corresponding NZ_CP accession
+            nz_cp_accession = assembly_accession.replace('GCA_', 'NZ_CP')
+            return nz_cp_accession
+
+        return None
+
+    def _find_nucleotide_accessions_for_assembly(self, assembly_id: str) -> List[str]:
+        """Find nucleotide accessions linked to an assembly ID"""
         try:
-            root = ET.fromstring(response.text)
-            for docsum in root.findall('.//DocSum'):
-                # Look for GenBank accession in assembly summary
-                for item in docsum.findall('Item'):
-                    name = item.get('Name')
-                    if name == 'Synonym' and item.text:
-                        # Extract GenBank accession from synonym
-                        synonym_text = item.text
-                        if 'GenBank:' in synonym_text:
-                            genbank_acc = synonym_text.split('GenBank:')[1].split(';')[0].strip()
-                            if genbank_acc:
-                                nucleotide_accessions.append(genbank_acc)
-                                break
-                    elif name == 'AssemblyAccession' and item.text:
-                        # Use assembly accession if no GenBank accession found
-                        nucleotide_accessions.append(item.text)
-                        break
-        except ET.ParseError:
-            logging.warning("Failed to parse assembly summary response")
-        
-        return nucleotide_accessions
+            # Use elink to find nucleotide records linked to this assembly
+            elink_url = NCBI_BASE_URL + "elink.fcgi"
+            params = {
+                'dbfrom': 'assembly',
+                'db': 'nuccore',
+                'id': assembly_id,
+                'email': self.email,
+                'api_key': self.api_key if self.api_key else None
+            }
+
+            params = {k: v for k, v in params.items() if v is not None}
+            response = self._make_request(elink_url, params)
+
+            if response:
+                root = ET.fromstring(response.text)
+                accessions = []
+
+                for link in root.findall('.//Link/Id'):
+                    if link.text:
+                        accessions.append(link.text)
+
+                return accessions
+
+        except Exception as e:
+            logging.debug(f"Failed to find nucleotide accessions for assembly {assembly_id}: {e}")
+
+        return []
+
+    def _is_valid_nucleotide_accession(self, accession: str) -> bool:
+        """Validate if an accession looks like a valid nucleotide accession"""
+        if not accession:
+            return False
+
+        accession = accession.upper()
+
+        # Valid nucleotide accession patterns
+        valid_patterns = [
+            r'^[A-Z]{2}\d+$',           # NC_12345, CP123456, etc.
+            r'^[A-Z]{2}_\d+$',          # NZ_CP123456, etc.
+            r'^[A-Z]{3,4}\d+$',         # NZ_CP123456, etc.
+        ]
+
+        for pattern in valid_patterns:
+            if re.match(pattern, accession):
+                return True
+
+        return False
 
     def _search_nuccore_fallback(self, query: str, max_results: int) -> List[str]:
         """Enhanced nuccore search with metadata-focused queries"""
@@ -542,52 +662,72 @@ class NCBIClient:
         return assembly_ids
 
     def _extract_assembly_metadata_batch(self, assembly_ids: List[str], corresponding_accessions: List[str]) -> List[Dict[str, Any]]:
-        """Extract rich metadata from assembly records"""
+        """Extract rich metadata from assembly records with enhanced caching and quality filtering"""
         if not assembly_ids:
             return []
 
-        # Get assembly summaries in batch
-        summary_url = NCBI_BASE_URL + "esummary.fcgi"
-        params = {
-            'db': 'assembly',
-            'id': ','.join(assembly_ids),
-            'retmode': 'xml',
-            'email': self.email,
-            'api_key': self.api_key if self.api_key else None
-        }
-
-        params = {k: v for k, v in params.items() if v is not None}
-        response = self._make_request(summary_url, params)
-
-        if not response:
-            return [self._create_empty_metadata(acc) for acc in corresponding_accessions]
-
         metadata_list = []
-        try:
-            root = ET.fromstring(response.text)
-            
-            for i, docsum in enumerate(root.findall('.//DocSum')):
-                # Get corresponding accession for this assembly
-                accession = corresponding_accessions[i] if i < len(corresponding_accessions) else "unknown"
-                
-                metadata = self._parse_assembly_metadata(docsum, accession)
-                
+        high_quality_metadata = []
+
+        # Process assemblies individually to use caching and apply quality filtering
+        for i, assembly_id in enumerate(assembly_ids):
+            accession = corresponding_accessions[i] if i < len(corresponding_accessions) else "unknown"
+
+            # Try cached assembly metadata first
+            assembly_metadata = self._get_assembly_metadata_cached(assembly_id)
+
+            if assembly_metadata:
+                # Ensure accession is set correctly
+                assembly_metadata['accession'] = accession
+                assembly_metadata['genome_id'] = assembly_id
+
                 # If we have BioSample, get detailed BioSample metadata
-                if metadata.get('biosample'):
-                    biosample_metadata = self._get_biosample_metadata(metadata['biosample'])
+                if assembly_metadata.get('biosample'):
+                    biosample_metadata = self._get_biosample_metadata_cached(assembly_metadata['biosample'])
                     if biosample_metadata:
-                        metadata.update(biosample_metadata)
-                        logging.debug(f"Enhanced {accession} with BioSample metadata")
+                        assembly_metadata.update(biosample_metadata)
+                        logging.debug(f"Enhanced {accession} with BioSample metadata from cache")
 
                 # Calculate quality score
-                metadata['quality_score'] = self._calculate_metadata_score(metadata)
-                metadata_list.append(metadata)
+                assembly_metadata['quality_score'] = self._calculate_metadata_score(assembly_metadata)
 
-        except ET.ParseError as e:
-            logging.error(f"Failed to parse assembly metadata XML: {e}")
-            return [self._create_empty_metadata(acc) for acc in corresponding_accessions]
+                # Apply quality filtering - only keep high-quality assemblies
+                if self._is_high_quality_assembly(assembly_metadata):
+                    high_quality_metadata.append(assembly_metadata)
+                    logging.debug(f"Accepted high-quality assembly {assembly_id} (score: {assembly_metadata['quality_score']})")
+                else:
+                    logging.debug(f"Rejected low-quality assembly {assembly_id} (score: {assembly_metadata.get('quality_score', 0)})")
 
-        return metadata_list
+        # If we don't have enough high-quality assemblies, supplement with lower quality ones
+        if len(high_quality_metadata) < len(assembly_ids) * 0.5:  # Less than 50% high quality
+            logging.info(f"Only {len(high_quality_metadata)} high-quality assemblies found, supplementing with lower quality")
+
+            # Get all metadata and sort by quality
+            all_metadata = []
+            for i, assembly_id in enumerate(assembly_ids):
+                if i < len(high_quality_metadata) and high_quality_metadata[i]['genome_id'] == assembly_id:
+                    continue  # Already have this one
+
+                accession = corresponding_accessions[i] if i < len(corresponding_accessions) else "unknown"
+                metadata = self._get_assembly_metadata_cached(assembly_id)
+                if metadata:
+                    metadata['accession'] = accession
+                    metadata['genome_id'] = assembly_id
+                    metadata['quality_score'] = self._calculate_metadata_score(metadata)
+                    all_metadata.append(metadata)
+
+            # Sort by quality and add top ones to reach target
+            all_metadata.sort(key=lambda x: x.get('quality_score', 0), reverse=True)
+            target_count = min(len(assembly_ids), max(10, len(high_quality_metadata) * 2))  # At least 10 or 2x high quality
+
+            for metadata in all_metadata:
+                if len(high_quality_metadata) >= target_count:
+                    break
+                if not any(m['genome_id'] == metadata['genome_id'] for m in high_quality_metadata):
+                    high_quality_metadata.append(metadata)
+
+        logging.info(f"Extracted metadata for {len(high_quality_metadata)} high-quality assemblies")
+        return high_quality_metadata
 
     def _parse_assembly_metadata(self, docsum: ET.Element, accession: str) -> Dict[str, Any]:
         """Parse metadata from assembly DocSum XML - much richer than nuccore"""
@@ -756,6 +896,31 @@ class NCBIClient:
     def _get_biosample_metadata_cached(self, biosample_id: str) -> Dict[str, Any]:
         """Cached BioSample metadata retrieval for frequently accessed samples"""
         return self._get_single_biosample_metadata(biosample_id)
+
+    @lru_cache(maxsize=1000)
+    def _get_assembly_metadata_cached(self, assembly_id: str) -> Dict[str, Any]:
+        """Cached assembly metadata retrieval for performance"""
+        try:
+            summary_url = NCBI_BASE_URL + "esummary.fcgi"
+            params = {
+                'db': 'assembly',
+                'id': assembly_id,
+                'retmode': 'xml',
+                'email': self.email,
+                'api_key': self.api_key if self.api_key else None
+            }
+
+            params = {k: v for k, v in params.items() if v is not None}
+            response = self._make_request(summary_url, params)
+
+            if response:
+                root = ET.fromstring(response.text)
+                for docsum in root.findall('.//DocSum'):
+                    return self._parse_assembly_metadata(docsum, None)
+        except Exception as e:
+            logging.debug(f"Failed to get cached assembly metadata for {assembly_id}: {e}")
+
+        return {}
     
     @lru_cache(maxsize=200)
     def _get_bioproject_metadata_cached(self, bioproject_id: str) -> Dict[str, Any]:
@@ -808,11 +973,57 @@ class NCBIClient:
         
         return metadata
 
+    def _is_high_quality_assembly(self, metadata: Dict[str, Any]) -> bool:
+        """Determine if an assembly meets high-quality criteria for AMR research"""
+        quality_score = metadata.get('quality_score', 0)
+
+        # Must have minimum quality score
+        if quality_score < 4:
+            return False
+
+        # Must have BioSample ID (critical for AMR research)
+        if not metadata.get('biosample'):
+            return False
+
+        # Must be complete genome or chromosome level
+        assembly_level = metadata.get('assembly_level', '').lower()
+        if assembly_level not in ['complete genome', 'chromosome']:
+            return False
+
+        # Must have some collection metadata (date, country, or host)
+        has_collection_data = any([
+            metadata.get('collection_date'),
+            metadata.get('country'),
+            metadata.get('host'),
+            metadata.get('isolation_source')
+        ])
+
+        if not has_collection_data:
+            return False
+
+        # Bonus: Must have some AMR-relevant data
+        has_amr_data = any([
+            metadata.get('mic_data'),
+            metadata.get('antibiotic_resistance'),
+            metadata.get('resistance_phenotype')
+        ])
+
+        # For high quality, prefer assemblies with AMR data
+        if quality_score >= 7 and has_amr_data:
+            return True
+        elif quality_score >= 6 and has_collection_data:
+            return True
+        elif quality_score >= 5:
+            return True
+
+        return False
+
     def _clear_cache(self):
         """Clear all cached data - useful for testing or memory management"""
         self._get_biosample_metadata_cached.cache_clear()
+        self._get_assembly_metadata_cached.cache_clear()
         self._get_bioproject_metadata_cached.cache_clear()
-        logging.info("Metadata caches cleared")
+        logging.info("All metadata caches cleared")
 
     def get_cache_stats(self) -> Dict[str, Any]:
         """Get cache statistics for monitoring"""
