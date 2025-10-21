@@ -55,6 +55,49 @@ python ncbi_genome_extractor.py --query "Escherichia coli[Organism] AND complete
 
 **Clean, simple commands - metadata is extracted automatically!**
 
+### 📋 Download from Accession List
+
+**Have a list of specific genome accessions? Upload them directly for batch download!**
+
+**Download genomes from a file containing accession numbers:**
+
+```bash
+# Create a file with one accession per line (e.g., accessions.txt)
+echo -e "CP000001\nCP000002\nNC_000001" > accessions.txt
+
+# Download all genomes from the list
+python scripts/download_accessions.py accessions.txt
+
+# Download first 50 genomes from a large list
+python scripts/download_accessions.py accessions.txt --max_genomes 50
+
+# Download to specific directory
+python scripts/download_accessions.py accessions.txt --output_dir ./my_genomes
+```
+
+**Accession file format:**
+- One accession number per line
+- Supports any valid NCBI accession (CP*, NC_*, NZ_*, etc.)
+- Empty lines and whitespace are ignored
+
+**Advanced accession list options:**
+```bash
+# Filter by genome type (only complete genomes)
+python scripts/download_accessions.py accessions.txt --genome_types complete
+
+# Exclude plasmids and contigs
+python scripts/download_accessions.py accessions.txt --exclude_types plasmid contig
+
+# Skip metadata extraction for faster downloads
+python scripts/download_accessions.py accessions.txt --skip_metadata
+```
+
+**Perfect for:**
+- Downloading specific genomes from publications
+- Replicating previous analyses with known accessions
+- Batch processing curated genome lists
+- Following up on search results with specific accessions
+
 ### 🎯 Smart Genome Selection
 
 **The tool automatically selects the BEST genomes based on metadata quality:**
