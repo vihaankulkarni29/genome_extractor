@@ -3,6 +3,7 @@
 NCBI Client - Handles all interactions with NCBI Entrez API
 """
 
+import json
 import logging
 import os
 import re
@@ -26,11 +27,13 @@ from config import (
 class NCBIClient:
     """Client for NCBI Entrez API interactions"""
 
-    def __init__(self, email: str = NCBI_EMAIL, api_key: str = NCBI_API_KEY, retries: int = DEFAULT_RETRIES, delay: float = DEFAULT_DELAY, log_level: str = "INFO", log_file: str = None):
+    def __init__(self, email: str = NCBI_EMAIL, api_key: str = NCBI_API_KEY, retries: int = DEFAULT_RETRIES, delay: float = DEFAULT_DELAY, log_level: str = "INFO", log_file: str = None, max_workers: int = 4, checkpoint_file: str = None):
         self.email = email
         self.api_key = api_key
         self.retries = retries
         self.delay = delay
+        self.max_workers = max_workers  # For parallel processing
+        self.checkpoint_file = checkpoint_file  # For resume functionality
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': f'FederatedGenomeHarvester/1.0 (mailto:{self.email})'
@@ -42,6 +45,9 @@ class NCBIClient:
         else:
             logging.basicConfig(level=getattr(logging, log_level.upper(), logging.INFO), format=log_format)
         self.logger = logging.getLogger("NCBIClient")
+
+        # Initialize checkpoint system
+        self.checkpoint_data = self._load_checkpoint() if checkpoint_file else {}
 
     def download_fasta(self, accession: str, output_dir: str, retries: Optional[int] = None, delay: Optional[float] = None) -> bool:
         """Download FASTA sequence with assembly-first optimization for maximum efficiency"""
@@ -1017,6 +1023,39 @@ class NCBIClient:
             return True
 
         return False
+
+    def _load_checkpoint(self) -> Dict[str, Any]:
+        """Load checkpoint data from file"""
+        if not self.checkpoint_file or not os.path.exists(self.checkpoint_file):
+            return {}
+
+        try:
+            with open(self.checkpoint_file, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            logging.warning(f"Failed to load checkpoint file {self.checkpoint_file}: {e}")
+            return {}
+
+    def _save_checkpoint(self, data: Dict[str, Any]):
+        """Save checkpoint data to file"""
+        if not self.checkpoint_file:
+            return
+
+        try:
+            os.makedirs(os.path.dirname(self.checkpoint_file), exist_ok=True)
+            with open(self.checkpoint_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except IOError as e:
+            logging.warning(f"Failed to save checkpoint file {self.checkpoint_file}: {e}")
+
+    def _update_checkpoint(self, key: str, value: Any):
+        """Update a specific checkpoint value"""
+        self.checkpoint_data[key] = value
+        self._save_checkpoint(self.checkpoint_data)
+
+    def _get_checkpoint(self, key: str, default: Any = None) -> Any:
+        """Get a checkpoint value"""
+        return self.checkpoint_data.get(key, default)
 
     def _clear_cache(self):
         """Clear all cached data - useful for testing or memory management"""
