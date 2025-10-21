@@ -3,12 +3,14 @@
 NCBI Client - Handles all interactions with NCBI Entrez API
 """
 
+import gzip
 import json
 import logging
 import os
 import re
 import sys
 import time
+import urllib.request
 import xml.etree.ElementTree as ET
 from typing import List, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -68,19 +70,97 @@ class NCBIClient:
         """Download FASTA from assembly database (much faster for complete genomes)"""
         try:
             # Find the assembly accession linked to this nucleotide accession
-            assembly_accession = self._find_linked_assembly(accession)
-            if not assembly_accession:
-                logging.debug(f"No linked assembly found for {accession}")
+            assembly_id = self._find_linked_assembly(accession)
+            if not assembly_id:
+                self.logger.debug(f"No linked assembly found for {accession}")
                 return False
 
-            # For assembly database, we need to use different URL and parameters
-            # Assembly downloads use FTP links rather than efetch
-            logging.debug(f"Assembly download not yet optimized for {accession}, using nuccore fallback")
-            return False
+            # Get FTP path for this assembly
+            ftp_path = self._get_assembly_ftp_path(assembly_id)
+            if not ftp_path:
+                self.logger.debug(f"No FTP path found for assembly {assembly_id}")
+                return False
+
+            # Construct FASTA file URL (genomic.fna.gz)
+            fasta_filename = os.path.basename(ftp_path) + "_genomic.fna.gz"
+            fasta_url = f"{ftp_path}/{fasta_filename}"
+            
+            # Download with retry logic
+            output_filename = f"{accession}.fasta"
+            output_path = os.path.join(output_dir, output_filename)
+            
+            success = self._download_ftp_with_retry(fasta_url, output_path, accession, retries, delay)
+            
+            if success:
+                self.logger.info(f"✓ Assembly FTP download: {accession} from {fasta_filename}")
+                return True
+            else:
+                return False
 
         except Exception as e:
-            logging.debug(f"Assembly download error for {accession}: {e}")
+            self.logger.debug(f"Assembly download error for {accession}: {e}")
             return False
+
+    def _download_ftp_with_retry(self, ftp_url: str, output_path: str, accession: str, retries: int, delay: float) -> bool:
+        """Download file from FTP with retry logic and decompression"""
+        for attempt in range(retries + 1):
+            try:
+                self.logger.debug(f"Attempting FTP download from {ftp_url} (attempt {attempt + 1}/{retries + 1})")
+                
+                # Download compressed file
+                temp_gz_path = output_path + ".gz"
+                
+                # Use urllib for FTP download with timeout
+                with urllib.request.urlopen(ftp_url, timeout=60) as response:
+                    total_size = int(response.headers.get('Content-Length', 0))
+                    
+                    with open(temp_gz_path, 'wb') as f:
+                        if total_size > 0:
+                            with tqdm(
+                                desc=f"Downloading {accession} (FTP)",
+                                total=total_size,
+                                unit='B',
+                                unit_scale=True,
+                                unit_divisor=1024,
+                            ) as pbar:
+                                while True:
+                                    chunk = response.read(8192)
+                                    if not chunk:
+                                        break
+                                    f.write(chunk)
+                                    pbar.update(len(chunk))
+                        else:
+                            # No content length, just download
+                            f.write(response.read())
+                
+                # Decompress the file
+                with gzip.open(temp_gz_path, 'rb') as f_in:
+                    with open(output_path, 'wb') as f_out:
+                        f_out.write(f_in.read())
+                
+                # Remove temporary compressed file
+                os.remove(temp_gz_path)
+                
+                self.logger.debug(f"Successfully downloaded and decompressed {accession}")
+                return True
+
+            except Exception as e:
+                self.logger.warning(f"FTP download attempt {attempt + 1} failed for {accession}: {e}")
+                
+                # Clean up partial files
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                temp_gz_path = output_path + ".gz"
+                if os.path.exists(temp_gz_path):
+                    os.remove(temp_gz_path)
+                
+                if attempt < retries:
+                    sleep_time = delay * (2 ** attempt)
+                    self.logger.info(f"Retrying FTP download in {sleep_time:.2f} seconds...")
+                    time.sleep(sleep_time)
+
+        self.logger.error(f"Failed FTP download for {accession} after {retries + 1} attempts")
+        return False
 
     def _download_from_nuccore(self, accession: str, output_dir: str, retries: int, delay: float) -> bool:
         """Fallback download from nuccore database"""
@@ -160,6 +240,51 @@ class NCBIClient:
                         
         except Exception as e:
             logging.debug(f"Failed to find linked assembly for {accession}: {e}")
+        
+        return None
+
+    def _get_assembly_ftp_path(self, assembly_id: str) -> Optional[str]:
+        """Convert assembly ID to FTP URL by fetching assembly summary metadata"""
+        try:
+            # Get assembly summary to find FTP path
+            summary_url = NCBI_BASE_URL + "esummary.fcgi"
+            params = {
+                'db': 'assembly',
+                'id': assembly_id,
+                'retmode': 'xml',
+                'email': self.email,
+                'api_key': self.api_key if self.api_key else None
+            }
+
+            params = {k: v for k, v in params.items() if v is not None}
+            response = self._make_request(summary_url, params)
+
+            if not response:
+                return None
+
+            root = ET.fromstring(response.text)
+            docsum = root.find('.//DocSum')
+            
+            if docsum is None:
+                return None
+
+            # Extract FTP path from assembly summary
+            for item in docsum.findall('Item'):
+                name = item.get('Name')
+                if name == 'FtpPath_GenBank' and item.text:
+                    ftp_path = item.text.strip()
+                    if ftp_path:
+                        self.logger.debug(f"Found FTP path for assembly {assembly_id}: {ftp_path}")
+                        return ftp_path
+                elif name == 'FtpPath_RefSeq' and item.text:
+                    # Prefer GenBank, but RefSeq is also valid
+                    ftp_path = item.text.strip()
+                    if ftp_path:
+                        self.logger.debug(f"Found RefSeq FTP path for assembly {assembly_id}: {ftp_path}")
+                        return ftp_path
+
+        except Exception as e:
+            self.logger.debug(f"Failed to get FTP path for assembly {assembly_id}: {e}")
         
         return None
 
