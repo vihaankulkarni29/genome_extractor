@@ -88,6 +88,9 @@ python scripts/download_accessions.py accessions.txt --genome_types complete
 # Exclude plasmids and contigs
 python scripts/download_accessions.py accessions.txt --exclude_types plasmid contig
 
+# Export metadata as CSV (easier to read in Excel)
+python scripts/download_accessions.py accessions.txt --metadata_format csv
+
 # Skip metadata extraction for faster downloads
 python scripts/download_accessions.py accessions.txt --skip_metadata
 ```
